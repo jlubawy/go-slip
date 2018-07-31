@@ -7,109 +7,140 @@ package slip
 import (
 	"bytes"
 	"encoding/hex"
+	"strings"
 	"testing"
 )
 
 func mustDecodeHex(s string) []byte {
-	data, err := hex.DecodeString(s)
+	data, err := hex.DecodeString(strings.Replace(s, " ", "", -1))
 	if err != nil {
 		panic(err)
 	}
 	return data
 }
 
-func TestEncode(t *testing.T) {
+func TestStandardScanner(t *testing.T) {
 	var cases = []struct {
 		expectErr bool
 		input     []byte
-		output    []byte
+		outputs   [][]byte
 	}{
 		{
 			expectErr: false,
-			input:     mustDecodeHex("0601EFCD060A01265C0000BC010000D6BE898E402100FD0327D3DAD80201061106BA5689A6FABFA2BD01467D6E00FBABAD05160A1805061E77F2"),
-			output:    mustDecodeHex("AB0601EFCDCE060A01265C0000CDBD010000D6BE898E402100FD0327D3DAD80201061106BA5689A6FABFA2BD01467D6E00FBCDACAD05160A1805061E77F2BC"),
-		},
-		{
-			expectErr: false,
-			input:     mustDecodeHex(""),
-			output:    mustDecodeHex("ABBC"),
+			input:     mustDecodeHex("010203C0 04DBDCC0 DBDD05C0"),
+			outputs: [][]byte{
+				mustDecodeHex("010203"),
+				mustDecodeHex("04C0"),
+				mustDecodeHex("DB05"),
+			},
 		},
 	}
-
 	for i, tc := range cases {
 		t.Logf("Test case %d", i)
 
-		enc := Encode(tc.input)
-		if !bytes.Equal(tc.output, enc) {
-			t.Error("data mismatch")
-			t.Errorf("expected: %X", tc.output)
-			t.Errorf("actual  : %X", enc)
+		scanner := NewScanner(StdEncoding, bytes.NewReader(tc.input))
+		actuals := make([][]byte, 0)
+		for scanner.Scan() {
+			actuals = append(actuals, scanner.Bytes())
+		}
+		if err := scanner.Err(); err != nil {
+			if !tc.expectErr {
+				t.Errorf("unexpected error: %v", err)
+			}
+		} else {
+			if tc.expectErr {
+				t.Error("expected error")
+			} else {
+				if len(actuals) != len(tc.outputs) {
+					t.Errorf("expected %d outputs but only got %d", len(tc.outputs), len(actuals))
+				} else {
+					for j := 0; j < len(tc.outputs); j++ {
+						if !bytes.Equal(tc.outputs[j], actuals[j]) {
+							t.Errorf("mismatch at index %d", j)
+							t.Errorf("   expected=% X", tc.outputs[j])
+							t.Errorf("   actual  =% X", actuals[j])
+						}
+					}
+				}
+			}
 		}
 	}
 }
 
-func TestDecode(t *testing.T) {
+func TestBluefruitScanner(t *testing.T) {
 	var cases = []struct {
 		expectErr bool
 		input     []byte
-		output    []byte
+		outputs   [][]byte
 	}{
 		{
 			expectErr: false,
-			input:     mustDecodeHex("AB0601EFCDCE060A01265C0000CDBD010000D6BE898E402100FD0327D3DAD80201061106BA5689A6FABFA2BD01467D6E00FBCDACAD05160A1805061E77F2BC"),
-			output:    mustDecodeHex("0601EFCD060A01265C0000BC010000D6BE898E402100FD0327D3DAD80201061106BA5689A6FABFA2BD01467D6E00FBABAD05160A1805061E77F2"),
+			input:     mustDecodeHex("AB010203BC AB04CDACCDBDBC ABCDCE05BC"),
+			outputs: [][]byte{
+				mustDecodeHex("010203"),
+				mustDecodeHex("04ABBC"),
+				mustDecodeHex("CD05"),
+			},
 		},
 
-		// Empty packet
+		// Invalid control character
 		{
 			expectErr: true,
-			input:     mustDecodeHex(""),
-			output:    mustDecodeHex(""),
+			input:     mustDecodeHex("AB04CDABCDBDBC"),
+			outputs:   nil,
 		},
-		// Missing start
+	}
+	for i, tc := range cases {
+		t.Logf("Test case %d", i)
+
+		scanner := NewScanner(BluefruitEncoding, bytes.NewReader(tc.input))
+		actuals := make([][]byte, 0)
+		for scanner.Scan() {
+			actuals = append(actuals, scanner.Bytes())
+		}
+		if err := scanner.Err(); err != nil {
+			if !tc.expectErr {
+				t.Errorf("unexpected error: %v", err)
+			}
+		} else {
+			if tc.expectErr {
+				t.Error("expected error")
+			} else {
+				if len(actuals) != len(tc.outputs) {
+					t.Errorf("expected %d outputs but only got %d", len(tc.outputs), len(actuals))
+				} else {
+					for j := 0; j < len(tc.outputs); j++ {
+						if !bytes.Equal(tc.outputs[j], actuals[j]) {
+							t.Errorf("mismatch at index %d", j)
+							t.Errorf("   expected=% X", tc.outputs[j])
+							t.Errorf("   actual  =% X", actuals[j])
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestStandardEncode(t *testing.T) {
+	var cases = []struct {
+		input  []byte
+		output []byte
+	}{
 		{
-			expectErr: true,
-			input:     mustDecodeHex("00BC"),
-			output:    mustDecodeHex(""),
-		},
-		// Missing end
-		{
-			expectErr: true,
-			input:     mustDecodeHex("AB00"),
-			output:    mustDecodeHex(""),
-		},
-		// Short escape sequence
-		{
-			expectErr: true,
-			input:     mustDecodeHex("ABCDBC"),
-			output:    mustDecodeHex(""),
-		},
-		// Non-escape character
-		{
-			expectErr: true,
-			input:     mustDecodeHex("ABCD01BC"),
-			output:    mustDecodeHex(""),
+			input:  mustDecodeHex("010203 C0   DC DB   DD"),
+			output: mustDecodeHex("010203 DBDC DC DBDD DD C0"),
 		},
 	}
 
 	for i, tc := range cases {
 		t.Logf("Test case %d", i)
 
-		data, err := Decode(tc.input)
-		if tc.expectErr {
-			if err == nil {
-				t.Error("expected error")
-			}
-		} else {
-			if err != nil {
-				t.Errorf("unexpected error: %v", err)
-			} else {
-				if !bytes.Equal(tc.output, data) {
-					t.Error("data mismatch")
-					t.Errorf("expected: %X", tc.output)
-					t.Errorf("actual  : %X", data)
-				}
-			}
+		enc := StdEncoding.Encode(tc.input)
+		if !bytes.Equal(tc.output, enc) {
+			t.Error("data mismatch")
+			t.Errorf("expected: %X", tc.output)
+			t.Errorf("actual  : %X", enc)
 		}
 	}
 }

@@ -10,115 +10,208 @@ See https://en.wikipedia.org/wiki/Serial_Line_Internet_Protocol.
 package slip
 
 import (
+	"bufio"
 	"fmt"
+	"io"
 )
 
-const (
-	Start    byte = 0xAB
-	StartEsc byte = 0xAC
+// StartDisabled is used to disable Start character encoding.
+const StartDisabled = -1
 
-	End    byte = 0xBC
-	EndEsc byte = 0xBD
+// An Encoding describes a SLIP encoding. If a Start character is not used by
+// a particular encoding scheme then set Start to StartDisabled.
+type Encoding struct {
+	Start, EscStart rune
+	End, EscEnd     rune
+	Esc, EscEsc     rune
+}
 
-	Esc    byte = 0xCD
-	EscEsc byte = 0xCE
-)
+var StdEncoding = &Encoding{
+	Start:    StartDisabled,
+	EscStart: StartDisabled,
+	End:      0xC0,
+	EscEnd:   0xDC,
+	Esc:      0xDB,
+	EscEsc:   0xDD,
+}
 
-// Encode encodes the given data as a SLIP message.
-func Encode(data []byte) (enc []byte) {
-	// Count the number of characters that will need to be escaped so we can
-	// pre-calculate the length of the buffer
-	resCount := ReservedCharCount(data)
+var BluefruitEncoding = &Encoding{
+	Start:    0xAB,
+	EscStart: 0xAC,
+	End:      0xBC,
+	EscEnd:   0xBD,
+	Esc:      0xCD,
+	EscEsc:   0xCE,
+}
 
-	enc = make([]byte, len(data)+2+resCount)
+// An InvalidControlCharError is returned when a non-control character follows
+// an Escape character. It gives the index in the byte slice where the character
+// was found, and which character it was.
+type InvalidControlCharError struct {
+	Index       int
+	ControlChar byte
+}
 
-	enc[0] = Start
+func (e InvalidControlCharError) Error() string {
+	return fmt.Sprintf("invalid control character 0x%02X Escaped at index %d", e.ControlChar, e.Index)
+}
 
-	j := 1
+var _ bufio.SplitFunc = (*Encoding)(nil).SplitPackets
+
+// SplitPackets is a split function for a bufio.Scanner that returns a packet
+// for each token.
+func (enc *Encoding) SplitPackets(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	EndIndex := -1
+	tokenByteCount := 0
 	for i := 0; i < len(data); i++ {
-		switch data[i] {
-		case Start:
-			enc[j] = Esc
-			enc[j+1] = StartEsc
-			j += 2
-		case End:
-			enc[j] = Esc
-			enc[j+1] = EndEsc
-			j += 2
-		case Esc:
-			enc[j] = Esc
-			enc[j+1] = EscEsc
-			j += 2
+		r := rune(data[i])
+		if r == enc.End {
+			EndIndex = i
+			break
+		} else if r != enc.Esc {
+			tokenByteCount += 1
+		}
+	}
+	if EndIndex == -1 {
+		if atEOF {
+			advance = len(data)
+			token = data
+			err = io.EOF
+		}
+		return
+	}
 
-		default:
-			enc[j] = data[i]
-			j += 1
+	StartIndex := 0
+	if enc.Start != StartDisabled {
+		if rune(data[0]) == enc.Start {
+			StartIndex = 1
+			tokenByteCount -= 1
 		}
 	}
 
-	enc[len(enc)-1] = End
+	// Advance past the End character
+	advance = EndIndex + 1
+	token = make([]byte, tokenByteCount)
 
-	return
-}
-
-// Decode decodes a SLIP message and returns the data or an error if there was
-// one.
-func Decode(enc []byte) (data []byte, err error) {
-	if len(enc) < 2 {
-		return nil, fmt.Errorf("slip.Decode: packet is too short %d", len(enc))
-	}
-	if enc[0] != Start {
-		return nil, fmt.Errorf("slip.Decode: expected SLIP start (0x%02X) but got 0x%02X", Start, enc[0])
-	}
-	if enc[len(enc)-1] != End {
-		return nil, fmt.Errorf("slip.Decode: expected SLIP end (0x%02X) but got 0x%02X", End, enc[0])
-	}
-
-	enc = enc[1 : len(enc)-1] // discard the start/end characters
-	data = make([]byte, 0, len(enc))
-
-	var c byte
-	for i := 0; i < len(enc); i++ {
-		if enc[i] == Esc {
-			// Make sure there is at least one more character
-			if i+1 >= len(enc) {
-				return nil, fmt.Errorf("slip.Decode: expected an escaped character but reached the end of the buffer")
+	// Decode the input
+	inEscSeq := false
+	j := 0
+	for i := StartIndex; i < EndIndex; i++ {
+		r := rune(data[i])
+		if inEscSeq {
+			if !enc.isValidControlEscChar(data[i]) {
+				err = InvalidControlCharError{i, data[i]}
+				return
 			}
 
-			i += 1 // skip to the next character
+			inEscSeq = false
 
-			switch enc[i] {
-			case StartEsc:
-				c = Start
-			case EndEsc:
-				c = End
-			case EscEsc:
-				c = Esc
+			switch r {
+			case enc.EscStart:
+				token[j] = byte(enc.Start)
+				j += 1
+			case enc.EscEnd:
+				token[j] = byte(enc.End)
+				j += 1
+			case enc.EscEsc:
+				token[j] = byte(enc.Esc)
+				j += 1
 			default:
-				return nil, fmt.Errorf("slip.Decode: expected an escaped character but got 0x%02X", enc[i])
+				return
 			}
 		} else {
-			c = enc[i]
+			switch r {
+			case enc.Esc:
+				inEscSeq = true
+			default:
+				token[j] = data[i]
+				j += 1
+			}
 		}
-
-		data = append(data, c)
 	}
 
 	return
 }
 
-// IsReservedChar returns true if the character is reserved.
-func IsReservedChar(b byte) bool {
-	return b == Start || b == End || b == Esc
+// NewScanner returns a new bufio.Scanner with the split function set to SplitPackets.
+func NewScanner(enc *Encoding, r io.Reader) *bufio.Scanner {
+	scanner := bufio.NewScanner(r)
+	scanner.Split(enc.SplitPackets)
+	return scanner
 }
 
-// ReservedCharCount returns the number of characters that need to be escaped.
-func ReservedCharCount(data []byte) int {
-	count := 0
-	for _, b := range data {
-		if IsReservedChar(b) {
+func (enc *Encoding) minLength() int {
+	if enc.Start == StartDisabled {
+		return 1 // End
+	}
+	return 2 // Start+End
+}
+
+// isValidControlEscChar returns true if the character is a valid control character
+// for a given encoding.
+func (enc *Encoding) isValidControlEscChar(b byte) bool {
+	rb := rune(b)
+	if enc.EscStart == StartDisabled {
+		return rb == enc.EscEnd || rb == enc.EscEsc
+	}
+	return rb == enc.EscStart || rb == enc.EscEnd || rb == enc.EscEsc
+}
+
+// isValidControlChar returns true if the character is a valid control character
+// for a given encoding.
+func (enc *Encoding) isValidControlChar(b byte) bool {
+	rb := rune(b)
+	if enc.Start == StartDisabled {
+		return rb == enc.End || rb == enc.Esc
+	}
+	return rb == enc.Start || rb == enc.End || rb == enc.Esc
+}
+
+// controlCharCount returns the number of control characters that need to be
+// Escaped for a given encoding.
+func (enc *Encoding) controlCharCount(src []byte) (count int) {
+	for i := 0; i < len(src); i++ {
+		if enc.isValidControlChar(src[i]) {
 			count += 1
 		}
 	}
-	return count
+	return
+}
+
+// EncodedLen returns the size of the destination buffer needed to encode a
+// buffer for a given encoding.
+func (enc *Encoding) EncodedLen(src []byte) int {
+	return len(src) + enc.minLength() + enc.controlCharCount(src)
+}
+
+// Encode encodes the given data as a SLIP message.
+func (enc *Encoding) Encode(src []byte) (dst []byte) {
+	dst = make([]byte, enc.EncodedLen(src))
+
+	j := 0
+	if enc.Start != StartDisabled {
+		dst[j] = byte(enc.Start)
+		j += 1
+	}
+
+	for i := 0; i < len(src) && (j < len(dst)-1); i++ {
+		if enc.isValidControlChar(src[i]) {
+			dst[j] = byte(enc.Esc)
+			switch rune(src[i]) {
+			case enc.Start:
+				dst[j+1] = byte(enc.EscStart)
+			case enc.End:
+				dst[j+1] = byte(enc.EscEnd)
+			case enc.Esc:
+				dst[j+1] = byte(enc.EscEsc)
+			}
+			j += 2
+		} else {
+			dst[j] = src[i]
+			j += 1
+		}
+	}
+	dst[j] = byte(enc.End)
+
+	return
 }
